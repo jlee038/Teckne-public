@@ -1,244 +1,158 @@
 # Teckne
 
-An AI-powered image generation and social sharing platform. Users can generate images from text prompts, remix existing posts, and interact with a community feed through reactions, comments, and tags.
+An AI image generation and social sharing app. Users generate images from text prompts, remix and caption them, and post them to a community feed. The image model and LLM run on a self-hosted GPU server.
 
-This projects constists of three repositories:
+I designed and built all three services myself: the Flutter app, the Node.js API, and the Python GPU server.
 
-- **Teckne/** -- Flutter client (iOS, Android, Web)
-- **Teckne-server/** -- Node.js/Fastify REST API and WebSocket proxy
-- **ai-server/** -- Python/FastAPI GPU inference server (FLUX diffusion model)
-
----
-
-## What It Does
-
-- **Generate** images from natural language prompts via a real-time WebSocket pipeline with live progress feedback
-- **Remix** existing community posts, loads the original image into the generation flow as a starting point
-- **Browse** a filterable, paginated community feed (by time range, content type, and tags)
-- **React and comment** on posts; tag posts with searchable labels
-- **Watermark** downloaded images optionally via in-app settings
-- **Authenticate** with OAuth providers (Google, Apple, etc.) via Supabase Auth
+| | |
+|---|---|
+| **Services** | Flutter client, Node.js/Fastify API, Python/FastAPI GPU server, Supabase (Postgres, Storage, Auth) |
+| **AI models** | FLUX 3 Image Klein, a 9B LLM running in llama.cpp, and image and text safety filters |
+| **Status** | In-Development. |
 
 ---
 
-## System Architecture
+## Features
 
-```
-┌──────────────┐     REST / WebSocket      ┌─────────────────────┐
-│  Flutter App │ ─────────────────────────► │   Teckne-server     │
-│  (Dart)      │                            │   (Node.js/Fastify) │
-└──────────────┘                            └────────┬────────────┘
-                                                     │
-                                    ┌────────────────┼────────────────┐
-                                    │                │                │
-                                    ▼                ▼                ▼
-                             ┌────────────┐  ┌────────────┐  ┌────────────────┐
-                             │  Supabase  │  │  Supabase  │  │   ai-server    │
-                             │  Postgres  │  │  Storage   │  │ (Python/FLUX)  │
-                             └────────────┘  └────────────┘  └────────────────┘
+- Generate images from a prompt and watch the progress live
+- Get AI-suggested prompts and tags, or have the AI expand a short prompt into a detailed one
+- Remix posted images with a new prompt or new size
+- Add meme text and text boxes anywhere on the image
+- Post to a feed you can filter by time, type, tags, and who you follow
+- React, comment, follow, block, make collections, and save images privately
+- Report posts, comments, and users. Moderators vote on reports.
+- Pay for images with credits. Free accounts get a daily allowance.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    App["Flutter app"]
+    API["Teckne-server<br/>Node.js · Fastify"]
+    AI["ai-server<br/>Python · FastAPI · GPU"]
+    LLM["llama-server<br/>4-bit LLM"]
+    DB[("Postgres")]
+    ST[("Storage")]
+    Auth["Supabase Auth"]
+
+    App -- "REST + WebSocket, JWT" --> API
+    App -. "sign-in only" .-> Auth
+    API -- "secret key" --> DB
+    API -- "secret key" --> ST
+    API -- "WebSocket, shared secret" --> AI
+    AI -- "OpenAI-compatible API" --> LLM
+    AI -. "remix source downloads" .-> ST
 ```
 
-The Flutter app never connects to the GPU server directly. Teckne-server owns the shared secret and acts as the WebSocket proxy, so the AI server is never exposed to clients. Auth is enforced at the API layer by verifying Supabase JWTs before any database or storage operation.
+The app only talks to Teckne-server. ai-server sits on a private network and only accepts connections from Teckne-server, which authenticates with a shared secret. Teckne-server is also the only thing that talks to the database and storage, so all the auth checks live there. It verifies the Supabase JWT on every request and checks ownership and moderator permissions before reading or writing anything. The app only uses Supabase to sign in.
+
+### How an image gets made
+
+```mermaid
+sequenceDiagram
+    participant App as Flutter app
+    participant API as Teckne-server
+    participant DB as Postgres
+    participant AI as ai-server
+    participant LLM as llama-server
+
+    App->>API: Generate request with quoted price
+    API->>API: Validate request and price
+    API->>DB: Check account and credits
+    API->>AI: Forward with shared secret
+    AI->>AI: Wait in queue if GPU is busy
+    opt Prompt enhancement on
+        AI->>LLM: Expand prompt
+        LLM-->>AI: Detailed prompt
+    end
+    loop Each diffusion step
+        AI-->>API: Progress
+        API-->>App: Progress
+    end
+    AI->>AI: Safety check
+    AI-->>API: Image
+    API->>DB: Charge credits
+    API-->>App: Image + signature
+    App->>API: Post image with signature
+    API->>API: Check signature and text, resize image
+    API->>DB: Save post
+```
+
+## Technical Highlights
+
+### Running the models on one GPU
+
+- FLUX 3 Image Klein runs through Hugging Face `diffusers`. A 9B LLM (BFL's prompt upsampler, a Qwen3.5 fine-tune) runs next to it in `llama.cpp`.
+- I converted the LLM to GGUF and quantized it to 4-bit. It's about 5x faster than running it in `transformers` and small enough to stay on the GPU with the image model. 6-bit gave slightly better results but was 25% slower and used 1.5 GB more VRAM.
+- ai-server starts and stops llama-server itself and talks to it through its OpenAI-compatible API.
+- On GPUs with less than 48 GB of VRAM, the text encoder and transformer take turns on the GPU, so it still runs on a 24 GB card.
+- Each generation logs how long each stage took. Credit costs are set from those timings.
+
+### LLM features
+
+The same LLM does three things:
+
+- Expands short prompts into the detailed descriptions FLUX works best with.
+- Suggests prompt ideas. The server picks random words from lists (a subject, a setting, sometimes a twist) and has the model turn them into a creative image prompt.
+- Suggests tags. The output is constrained with a JSON schema so it always comes back as exactly three valid tags.
+
+### Queueing and cancellation
+
+The GPU can only make one image at a time, and each image takes several seconds. While that's happening, the server still needs to send progress updates, accept new connections, and listen for cancel requests.
+
+- Generation runs on a background thread (`run_in_executor`), so the main server loop stays free to handle WebSocket traffic. After each step, the background thread passes a progress update back to the main loop to send to the user.
+- A lock (`asyncio.Lock`) lets one generation run at a time. Up to 10 more requests wait in line, and those users see that they're queued. Prompt suggestions don't use the image model, so they skip the line.
+- Users can cancel partway through, so they don't wait or pay for an image they don't want, and the next person in line starts sooner. The diffusers pipeline has no built-in way to stop mid-run, so forward pre-hooks on the model check for a cancel and stop the run at the next step. Users can only cancel their own requests.
+
+### Content safety and moderation
+
+- Every generated image, and every image used as a remix source, goes through an image safety filter before anyone sees it. The FLUX license requires one.
+- Only images that came from ai-server can be posted. When Teckne-server sends an image to the app, it signs it with an HMAC of the user ID and the image hash. The post endpoint rejects uploads without a valid signature, so you can't post an arbitrary file by calling the API directly.
+- All user text (titles, captions, tags, comments) goes through a text safety filter before it's saved. If the model isn't available, the write is blocked instead of skipped.
+- Users can report posts, comments, and other users. Moderators vote without seeing each other's votes, and the item is removed once enough of them agree. Repeat offenders get longer bans each time.
+- Users have to accept the terms and finish their profile before generating. Deleting an account deletes all of the user's content. JWTs are redacted from logs.
+
+### API security
+
+- REST requests are validated with Fastify JSON schemas. The WebSocket proxy rebuilds each message from allowed fields instead of passing along whatever the client sent.
+- Remix images can only come from the project's storage bucket, the user's last generated image, or a saved image they own (through a short-lived signed URL). ai-server also refuses redirects and limits download size.
+- Rate limits on every route, one WebSocket per user, per-user generation quotas, and a 30-second heartbeat that drops dead connections and cancels their GPU jobs. The account is rechecked on every generation, so a banned user's open connection stops working.
+- Helmet, CORS, and an origin check on the WebSocket connection. Storage deletes use file paths from the database, not from the client.
+
+### Credits
+
+- One credit is roughly one second of GPU time. The price only depends on the request (size, steps, prompt enhancement, generate or remix), so it doesn't change with load.
+- The app gets a price table from the server, shows the cost on the Generate button, and sends that price back with the request. If it doesn't match, the request is refused, so users are never charged more than they saw.
+- Balances only exist in Postgres. Charges happen in database functions with row locks and get written to an append-only ledger. A unique key on each grant means a retried event can't add credits twice.
+- The daily free allowance resets without a cron job. There's also a daily cap on all free usage combined, so making extra accounts doesn't get more free GPU time overall.
+
+### Flutter client
+
+- Feature-first structure with Riverpod 3. Repositories handle data, notifiers handle state, and widgets just display it.
+- Routing is driven by one auth state enum hooked into GoRouter, so screens don't handle auth redirects themselves.
+- Meme text is stored as data and drawn on top of the image instead of baked in. All sizes are relative to the image, so it looks the same on a thumbnail and at 4K. It only gets burned in when you download, and editing a caption doesn't need a new image.
+- Uploaded images are saved in three sizes (320, 1280, and 2560 px), and the app loads the smallest one that fits.
 
 ---
 
 ## Tech Stack
 
-### Flutter Client (`Teckne/`)
-
-| Layer | Technology |
+| Layer | Technologies |
 |---|---|
-| Framework | Flutter (Material 3, dark theme) |
-| State management | Riverpod 2 with code generation (`riverpod_annotation`) |
-| Routing | GoRouter with `ShellRoute` and auth-driven redirects |
-| HTTP client | Dio with a custom auth interceptor and 401-only retry |
-| Real-time | WebSocket (`web_socket_channel`) for the image generation pipeline |
-| Auth and identity | Supabase Auth (PKCE flow, OAuth via `supabase_auth_ui`) |
-| Data models | Freezed + `json_serializable` |
-| Local storage | `shared_preferences` for settings; `flutter_secure_storage` for credentials |
-| Image loading | `cached_network_image` |
-| Fonts and icons | Google Fonts, Font Awesome Flutter |
-
-### API Server (`Teckne-server/`)
-
-| Layer | Technology |
-|---|---|
-| Runtime | Node.js (ES modules) |
-| Framework | Fastify v5 |
-| Auth | JWT verification via `jsonwebtoken` against Supabase JWT secret |
-| Database and storage | Supabase (Postgres RPC + Storage), user JWT forwarded per request |
-| Content moderation | TensorFlow.js toxicity model, loaded on startup |
-| WebSocket proxy | `ws` client to ai-server; `@fastify/websocket` for client connections |
-| Security | `@fastify/helmet`, `@fastify/cors`, `@fastify/rate-limit` (100 req / 15 min) |
-| File uploads | `@fastify/multipart`, 50MB cap |
-
-### AI Inference Server (`ai-server/`)
-
-| Layer | Technology |
-|---|---|
-| Runtime | Python 3.10+ |
-| Framework | FastAPI + Uvicorn |
-| Model | `black-forest-labs/FLUX.2-klein-4B` via Hugging Face `diffusers` |
-| Compute | PyTorch with CUDA (bfloat16); CPU offload if VRAM < 12GB |
-| Prompt generation | `succinctly/text2image-prompt-generator` for empty prompts |
-| Concurrency | `asyncio` event loop + `run_in_executor` for blocking inference |
+| Client | Flutter, Dart, Riverpod 3, GoRouter, Dio, Freezed, WebSockets |
+| API | Node.js, Fastify 5, `ws`, `sharp`, TensorFlow.js, `supabase-js`, `jsonwebtoken` |
+| Inference | Python, FastAPI, Uvicorn, asyncio, PyTorch (CUDA), Hugging Face `diffusers` and `transformers`, llama.cpp |
+| Data | PostgreSQL (Supabase) with SQL migrations and PL/pgSQL functions, Supabase Storage, Supabase Auth (OAuth, PKCE) |
+| Models | FLUX 3 Image Klein, BFL prompt upsampler (Qwen3.5-9B fine-tune, 4-bit GGUF), image and text safety filters |
 
 ---
 
-## Flutter Client Architecture
+## What's Next
 
-The client follows a **feature-first structure** with a shared services and widgets layer:
-
-```
-lib/
-├── config/           # Compile-time configuration (AppConfig via --dart-define)
-├── features/
-│   ├── create/       # Image generation and remix (UI, WebSocket repo, Riverpod controllers)
-│   ├── login/        # Auth state, OAuth login screen, AppUser model
-│   ├── posts/        # Feed, profiles, post/comment/reaction repos and providers
-│   └── settings/     # User preferences (watermark toggle)
-├── services/
-│   ├── api/          # Shared Dio instance, auth interceptor, retry policy
-│   ├── router.dart   # GoRouter config, shell scaffold, auth redirects
-│   └── websocket/    # Long-lived WebSocketService (Riverpod keepAlive)
-├── utils/            # Theme, responsive helpers, alerts
-└── widgets/          # Shared UI components (post shell, filters, comments, tags)
-```
-
-Each feature contains its own `models/`, `repos/`, `providers/`, `screens/`, and `widgets/` directories. Repositories handle all data access; Riverpod `AsyncNotifier` and `Notifier` classes own state; screens and widgets only read and dispatch.
-
----
-
-## API Server Architecture
-
-```
-src/
-├── server.js          # Process entry, graceful shutdown, toxicity model init
-├── app.js             # Plugin registration, routes, global error handler
-├── config/
-│   └── constants.js
-├── middleware/
-│   ├── setup.js       # CORS, Helmet, rate limiting
-│   └── auth.js        # JWT verification, Supabase client per request
-├── routes/
-│   ├── posts.js       # Feed queries, post creation and deletion
-│   ├── comments.js    # Comment creation and pagination
-│   ├── images.js      # Multipart upload and deletion
-│   ├── reactions.js   # Toggle reactions via Supabase RPC
-│   ├── tags.js        # Popular tags and tag search
-│   ├── users.js       # Username to user ID resolution
-│   └── websocket.js   # WebSocket proxy to ai-server
-└── services/
-    └── toxicityCheck.js
-```
-
----
-
-## Notable Implementations
-
-### Auth-Driven Routing (Flutter)
-
-`AppAuthState` is an enum that encodes **which path patterns are allowed** and **where to redirect** for each auth state. A `ValueNotifier<AppAuthState>` is passed to `GoRouter.refreshListenable`, so route guards re-evaluate automatically whenever auth changes. No manual navigation logic in UI code.
-
-### Startup Session Safety (Flutter)
-
-Before the app renders, `main.dart` waits for Supabase to either refresh an expired token or emit `signedOut` (with a timeout). This prevents the first outbound API calls from using a stale JWT without blocking the startup path longer than necessary.
-
-### WebSocket Image Generation Pipeline (All Three)
-
-The generation flow spans all three services. The Flutter client sends a JSON init message over its connection to Teckne-server; Teckne-server proxies the traffic to ai-server after injecting the shared secret. The ai-server streams back JSON status frames (queued, progress with step count, errors) and a final binary JPEG payload. The Flutter `GenerateImageController` distinguishes binary vs. string frames by payload type and updates UI state accordingly.
-
-The `WebSocketService` (Flutter) and the ai-server both use a **30-second inactivity timeout**, closing the connection if no messages are exchanged. Teckne-server validates that client-sent message `type` fields are within an allowed set before forwarding, so arbitrary messages cannot reach the inference server.
-
-### Serialized Inference with Cancellation (ai-server)
-
-The ai-server allows only one generation at a time per process. Additional connections receive a `status: queued` response and wait on `_generation_lock`. Cancellation sets `pipe._interrupt` on the diffusers pipeline, which is checked at each diffusion step boundary. After cancellation, the server runs `torch.cuda.synchronize` and `empty_cache` to reclaim VRAM before accepting the next job.
-
-Progress callbacks use `asyncio.run_coroutine_threadsafe` to push step updates from the executor thread back to the async WebSocket handler without blocking inference.
-
-### Content Moderation (Teckne-server)
-
-Automatic content moderation on titles, descriptions, tags, meme text, and comment text to filter out inappropriate content before any write reaches Supabase. A toxicity check model is loaded asynchronously after the HTTP server starts. On model load failure, `checkToxicity` fails closed, blocking the write rather than silently skipping the check.
-
-### Storage Security (Teckne-server)
-
-Post deletion fetches the `content_url` from the database server-side before removing the storage object, so clients cannot supply an arbitrary path to delete. Image deletion on orphaned uploads verifies that the storage path begins with the requesting user's `user_id` prefix before the storage operation runs.
-
-### Feed Pagination (Flutter)
-
-The home feed uses page-scoped Riverpod providers keyed by page number. A sentinel row at the bottom of the list triggers the next page load via `setState`. Pull-to-refresh invalidates all loaded page providers, causing Riverpod to refetch cleanly without manual list management.
-
-### Platform-Aware Downloads (Flutter)
-
-`DownloadController` branches on `kIsWeb` vs. mobile, resolves the correct save path via `path_provider`, and optionally composites a watermark onto the image before saving.
-
----
-
-## Configuration
-
-### Flutter (`Teckne/dart_defines.json`)
-
-```json
-{
-  "SUPABASE_URL": "https://your-project.supabase.co",
-  "SUPABASE_ANON_KEY": "your-anon-key",
-  "API_BASE_URL": "https://your-api.example.com",
-  "WS_BASE_URL": "wss://your-api.example.com"
-}
-```
-
-### API Server (`Teckne-server/.env`)
-
-```
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_ANON_KEY=your-anon-key
-SUPABASE_JWT_SECRET=your-jwt-secret
-CORS_ORIGIN=http://localhost:PORT
-WEBSOCKET_URL=ws://localhost:8000/ws/generate-image
-AI_SERVER_SECRET=your-shared-secret
-PORT=3000
-```
-
-### AI Server (`ai-server/.env`)
-
-```
-AI_SERVER_SECRET=your-shared-secret
-```
-
----
-
-## Running the Project
-
-### AI Server
-
-```bash
-cd ai-server
-pip install -r requirements.txt
-python verify_setup.py   # checks CUDA, torch, and dependencies
-python flux_server.py
-```
-
-### API Server
-
-```bash
-cd Teckne-server
-npm install
-node src/server.js
-```
-
-### Flutter Client
-
-```bash
-cd Teckne
-flutter pub get
-dart run build_runner build --delete-conflicting-outputs
-flutter run --dart-define-from-file=dart_defines.json
-```
-
----
-
-## What I'd Do Next
-
-- Expand post types (video, music)
-- Abstract the WebSocket protocol behind a typed event interface to make it easier to add new message types
-- Create logic for a suggested content feed based on user's interests and favorited tags
+- **Deploy:** containerize the three services, add CI, and run ai-server on a private GPU host.
+- **Tests:** add automated tests, starting with the credit functions and the WebSocket proxy's input validation.
+- **Recommendations from embeddings:** store image and caption embeddings in pgvector and rank the feed by similarity to the tags and posts each user engages with.
+- **Payments:** Stripe credit purchases.
+- **New post types:** Video generation.
